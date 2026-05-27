@@ -7,12 +7,15 @@ import { getRunRecorder } from "@/lib/prisma";
 import { buildProviders } from "@/lib/providers";
 import { getDefaultRateLimiter, hashClientIp } from "@/lib/rate-limit";
 import { streamRun } from "@/lib/run-stream";
+import { scanUrl } from "@/lib/scan-url";
+import { classifySeed } from "@/lib/seed-input";
 import { sseStreamFromEvents } from "@/lib/sse";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const MAX_SEED_LENGTH = 2_000;
+const MAX_SEED_LENGTH = 8_000;
+const MAX_RAW_SEED_LENGTH = 2_000;
 const DEFAULT_BUDGET_CAP_CENTS = 100;
 const FREE_TIER_ARCHETYPE_LIMIT = 1;
 const FREE_TIER_CANDIDATES_PER_ARCHETYPE = 3;
@@ -58,9 +61,15 @@ export async function POST(request: NextRequest): Promise<Response> {
   if (typeof body.seed !== "string" || !body.seed.trim()) {
     return NextResponse.json({ error: "seed is required" }, { status: 400 });
   }
-  if (body.seed.length > MAX_SEED_LENGTH) {
-    return NextResponse.json({ error: `seed exceeds ${MAX_SEED_LENGTH} chars` }, { status: 400 });
+  if (body.seed.length > MAX_RAW_SEED_LENGTH) {
+    return NextResponse.json(
+      { error: `seed exceeds ${MAX_RAW_SEED_LENGTH} chars` },
+      { status: 400 },
+    );
   }
+
+  const classified = classifySeed(body.seed);
+  let effectiveSeed = body.seed.trim();
 
   const { llm, email, mode } = buildProviders({
     userGeminiKey: asString(body.geminiApiKey),
@@ -127,6 +136,20 @@ export async function POST(request: NextRequest): Promise<Response> {
     );
   }
 
+  // URL detection runs AFTER rate-limit reservation so anonymous attackers
+  // cannot use /api/find as an unrate-limited outbound-fetch primitive. Scan
+  // failure is non-fatal — fall back to the raw URL so the LLM still has the
+  // domain to reason about. SSRF-protected in scan-url.ts.
+  if (classified.kind === "url" && classified.url) {
+    const scanned = await scanUrl(classified.url);
+    if (scanned.seed && scanned.seed.length > 0) {
+      effectiveSeed = scanned.seed;
+    }
+  }
+  if (effectiveSeed.length > MAX_SEED_LENGTH) {
+    effectiveSeed = effectiveSeed.slice(0, MAX_SEED_LENGTH);
+  }
+
   const finder = new IcpFinder({ llm, email });
 
   const stream = sseStreamFromEvents(
@@ -138,7 +161,7 @@ export async function POST(request: NextRequest): Promise<Response> {
       clientIpHash,
       mode,
       input: {
-        seed: body.seed,
+        seed: effectiveSeed,
         archetypeLimit,
         candidatesPerArchetype,
         grounding: body.grounding === true,
